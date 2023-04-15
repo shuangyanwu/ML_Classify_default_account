@@ -1,0 +1,632 @@
+library(tidyverse) 
+library(caret) #for Data splitting
+library(mice)
+library(VIM) #for plot missing data patterns
+library(glmnet) # for lasso and ridge regularization
+library(pROC) #For AUC calculation
+library(xgboost) 
+library(pdp) #for PCA
+library(car) # for VIF
+library(SHAPforxgboost) # for shapley value
+
+# R studio version: 2022.02.3
+#######################################################################
+#                                                                     #
+#                          Load the data                              #
+#                                                                     #
+#######################################################################
+df <- read_csv("Training_R-197135_Candidate Attach #1_JDSE_SRF #456.csv.csv")
+test <- read_csv("Test_R-197135_Candidate Attach #2_JDSE_SRF #456.csv")
+
+#######################################################################
+#                                                                     #
+#                          Split the data                             #
+#                                                                     #
+#######################################################################
+
+set.seed(1)
+training.samples <- df$Def_ind %>% createDataPartition(p = 0.8, list = FALSE)
+train <- df[training.samples, ] # training set
+val <- df[-training.samples, ] # validation set
+dim(train)
+dim(val)
+colnames(train)
+# Remove name space: num_auto_ 36_month
+colnames(train)[13] <- "num_auto_36_month"
+colnames(val)[13] <- "num_auto_36_month"
+colnames(test)[13] <- "num_auto_36_month"
+
+attach(train)
+# Data summary 
+trainc <- train # create a copy 
+trainc$num_acc_30d_past_due_12_months<-factor(trainc$num_acc_30d_past_due_12_months)
+trainc$num_acc_30d_past_due_6_months<-factor(trainc$num_acc_30d_past_due_6_months)
+trainc$ num_mortgage_currently_past_due<-factor(trainc$num_mortgage_currently_past_due)
+trainc$num_card_12_month <-factor(trainc$num_card_12_month)
+trainc$num_auto_36_month <-factor(trainc$num_auto_36_month)
+trainc$ind_XYZ <-factor(trainc$ind_XYZ)
+trainc$rep_education <- factor(trainc$rep_education)
+trainc$Def_ind <-factor(trainc$Def_ind)
+
+trainc_x_continuous <- trainc[,c(1,2,3,4,5,9,10,11,14,15,16,17,19)]
+summary(trainc_x_continuous) # statistics for continuous variables
+apply(trainc_x_continuous, 2, sd, na.rm =TRUE) # 2: by columns
+summary(trainc[,-c(1,2,3,4,5,9,10,11,14,15,16,17,19)]) # frequency count for categorical variables
+
+# Data exploration
+pairs(train[,c(14, 15, 16, 17)], cex = 0.8, col = "darkgreen",pch = 18, 
+      main = " Pair plots")
+
+plot(factor(Def_ind) ~ factor(ind_XYZ), data =train, 
+     ylab="Def_ind levels",xlab="ind_XYZ levels", main="Def_ind vs ind_XYZ")
+
+plot(factor(Def_ind) ~ factor(num_inq_12_month), data =train,
+     xlab = 'num_inq_12_month', ylab ='Def_ind Levels',main="Def_ind vs num_inq_12_month")
+
+plot(factor(Def_ind) ~ uti_open_card, data =train, 
+     xlab = 'uti_open_card', ylab ='Def_ind Levels',main="Def_ind vs uti_open_card")
+
+plot( factor(Def_ind) ~ (pct_over_50_uti), data =train,
+      xlab = 'pct_over_50_uti', ylab ='Def_ind Levels',main="Def_ind vs pct_over_50_uti")
+
+
+#######################################################################
+#                                                                     #
+#                           Data cleaning                             #
+#                                                                     #
+#######################################################################
+
+# Missing data percent and count
+pMiss <- function(x){
+  sum(is.na(x))/length(x)*100
+}
+
+(miss_tr <- sort(apply(train,2,pMiss) ,decreasing =TRUE)) #missing percentages
+(miss_val <- sort(apply(val,2,pMiss), decreasing =TRUE))
+(miss_ts <- sort(apply(test,2,pMiss), decreasing =TRUE)) 
+dim(train)[1]*miss_tr/100 #missing counts
+dim(val)[1]*miss_val/100
+dim(test)[1]*miss_ts/100
+
+# Missing data plots
+aggr(train[which(apply(train,2,pMiss)>0)], col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, 
+     labels=names(train[which(apply(train,2,pMiss)>0)]), cex.axis=0.5, gap=2, 
+     ylab=c("Histogram of missing data","Pattern"))
+aggr(val[which(apply(val,2,pMiss)>0)], col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, 
+     labels=names(val[which(apply(val,2,pMiss)>0)]), cex.axis=0.5, gap=2, 
+     ylab=c("Histogram of missing data","Pattern"))
+aggr(test[which(apply(test,2,pMiss)>0)], col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, 
+     labels=names(test[which(apply(test,2,pMiss)>0)]), cex.axis=0.5, gap=2, 
+     ylab=c("Histogram of missing data","Pattern"))
+
+# Impute missing data
+# Exclude categorical variables and y
+train2 <- subset(train, select = -c(rep_education, ind_XYZ,Def_ind))
+val2 <- subset(val, select = -c(rep_education, ind_XYZ,Def_ind))
+test2 <- subset(test, select = -c(rep_education, ind_XYZ,Def_ind))
+
+# impute continuous data - training set
+tempData <- mice(train2,m=5,maxit=50,meth='pmm',seed=500)
+completedData <- complete(tempData,1)
+train3<-as_tibble(cbind(completedData,train[, which(names(train) %in% 
+                              c('rep_education', 'ind_XYZ','Def_ind'))]))
+
+# categorical- training set, impute with mode
+which.max(table(train3$rep_education))
+train3$rep_education[is.na(train3$rep_education)] <- "college"
+
+# define X and Y - training
+train3$ind_XYZ  <- factor(train3$ind_XYZ)
+X_train =  train3[,-21]
+y_train = train3$Def_ind
+
+# impute continuous data - validation set
+tempData_val <- mice(val2,m=5,maxit=50,meth='pmm',seed=500)
+completedData <- complete(tempData_val,1)
+val3<-as_tibble(cbind(completedData,val[, which(names(val) %in% 
+                                                  c('rep_education', 'ind_XYZ','Def_ind'))]))
+
+# define X and y - validation
+val3$ind_XYZ  <- factor(val3$ind_XYZ)
+X_val =  val3[,-21]
+y_val = val3$Def_ind
+
+# impute continuous data - testing set
+tempData <- mice(test2,m=5,maxit=50,meth='pmm',seed=500)
+completedData <- complete(tempData,1)
+test3<-as_tibble(cbind(completedData,test[, which(names(test) %in% 
+                                                    c('rep_education', 'ind_XYZ','Def_ind'))]))
+
+# categorical, replace with mode
+which.max(table(test3$rep_education))
+test3$rep_education[is.na(test3$rep_education)] <- "high_school"
+
+# define X and y - testing
+test3$ind_XYZ  <- factor(test3$ind_XYZ)
+X_test =  test3[,-21]
+y_test = test3$Def_ind
+
+#######################################################################
+#                                                                     #
+#                          Check multicollinearity                    #
+#                                                                     #
+#######################################################################
+
+X_trainc <- subset(X_train, select = -c(rep_education, ind_XYZ)) # keep continuous x variables
+
+# check VIFs
+# x <- as.matrix(X_trainc)
+VIF = diag(solve(cor(X_trainc))); VIF # <10 # diagonal terms of inverse(correlation(X))
+
+# Check condition number (values need to be scaled)
+scale.x = scale(X_trainc)
+e = eigen(t(scale.x)%*%scale.x)
+sqrt(max(e$values)/min(e$values)) #<30, no serious multi-collinearity problem
+
+#######################################################################
+#                                                                     #
+#                   (1) Fit Logistic Regression Model                 #
+#                                                                     #
+#######################################################################
+
+# Methods 1:  use Lasso and Cross-validation
+# X_train2 <- subset(X_train, select = - ind_XYZ) kept to learn coding
+x_mtx <- model.matrix( ~.-1, X_train) # create dummy variables/One-hot emcoding for categorical variables; If use ~.-1, to remove intercept
+xt_mtx <- model.matrix( ~.-1, X_test)
+xv_mtx <- model.matrix( ~.-1, X_val)
+#x <- as.matrix(X_trainc)
+# cv.glmnet finds the best lambda to minimize cv error first
+# then glmnet find the best model coefficients with given lambda to minimize MSE
+set.seed(123) 
+
+fraction <- table(y_train)/length(y_train)
+# assign 1 - that value to a "weights" vector
+model_weights <- 1 - fraction[as.character(y_train)]
+# make the model
+
+model_weights <- ifelse(train3$Def_ind == "0",
+                        (1-(table(train3$Def_ind)[1]/length(train3$Def_ind))),
+                        (1-(table(train3$Def_ind)[2]/length(train3$Def_ind))))
+
+model_weights <- ifelse(train3$Def_ind == "0",
+                        (1/table(train3$Def_ind)[1]) * 0.5,
+                        (1/table(train3$Def_ind)[2]) * 0.5) # (best, reported online)
+#Both above are the same for results
+# model_weights (1,4) # tried diff numbers, should not use
+
+set.seed(123) 
+# To find best lambda
+cv.lasso <- cv.glmnet(x_mtx, factor(y_train), 
+    weights = model_weights, intercept=TRUE, alpha = 1, 
+    family = "binomial", nfolds=5) 
+# alpha=1 is lasso, 0 is ridge, default intercept=TRUE
+plot(cv.lasso)
+(best_lambda <- cv.lasso$lambda.min)
+# or use best_lambda <- cv.lasso$lambda[which.min(cv.lasso$cvm)] # cvm:the mean cross-validation error
+
+# Fit the final model on the training data
+model <- glmnet(x_mtx, y_train, alpha = 1, weights = model_weights,
+                family = "binomial",
+                lambda = best_lambda)
+# Display regression coefficients
+round(coef(model), 5)
+
+# Make predictions on the validation data
+probabilities_val <- model %>% predict(s='lambda.min', newx = xv_mtx, type="response")
+predicted.classes_val <- ifelse(probabilities_val >= 0.5, 1, 0)
+# Model accuracy
+observed.classes_val <- y_test
+confusionMatrix(factor(predicted.classes_val), factor(y_val), mode = "everything", positive="1")
+auc(y_val, as.vector(probabilities_val))# AUC
+plot(roc(y_val, probabilities_val), main="ROC curve -- Logistic Regression")
+
+# Make predictions on the test data
+probabilities <- model %>% predict(s='lambda.min', newx = xt_mtx, type="response")
+predicted.classes <- ifelse(probabilities >= 0.5, 1, 0)
+# Model accuracy
+observed.classes <- y_test
+confusionMatrix(factor(predicted.classes), factor(y_test), mode = "everything", positive="1")
+auc(y_test, as.vector(probabilities))# AUC
+plot(roc(y_test, probabilities), main="ROC curve -- Logistic Regression")
+
+
+# Method 2: Or use Stepwise model selection with AIC
+model_weights <- ifelse(train3$Def_ind == "0", 1, round(table(y_train)[1]/table(y_train)[2]))
+model <- glm(Def_ind ~., weights = model_weights, data = train3, family = 'binomial')
+summary(model)
+step(model) 
+
+# Selected model
+model_lr <- glm(Def_ind ~ tot_balance + avg_bal_cards + credit_age + 
+                  credit_age_good_account + num_acc_30d_past_due_12_months + 
+                  num_acc_30d_past_due_6_months + num_mortgage_currently_past_due + 
+                  num_inq_12_month + num_card_inq_24_month + num_card_12_month + 
+                  num_auto_36_month + uti_open_card + pct_over_50_uti + uti_max_credit_line + 
+                  pct_card_over_50_uti + rep_income + ind_XYZ + rep_education, 
+                family = "binomial", data = train3, weights = model_weights) # (final model)
+
+summary(model_lr)
+vif(model_lr)
+
+#############################################################
+#                                                           #
+#           Model Prediction - Logistic Regression          #
+#                                                           #
+#############################################################
+
+# improved for imbalanced data
+#############################################################
+pred_train <- predict (model_lr, X_train, type = "response")
+pred_val <- predict (model_lr, X_val, type = "response")
+pred_tclass <- pred_train
+pred_vclass <- pred_val
+
+pred_tclass[pred_tclass >=0.5] <- 1; pred_tclass[pred_tclass <0.5] <- 0
+pred_vclass[pred_vclass >=0.5] <- 1; pred_vclass[pred_vclass <0.5] <- 0
+confusionMatrix(factor(pred_tclass), factor(y_train), mode = "everything", positive="1") #train
+confusionMatrix(factor(pred_vclass), factor(y_val), mode = "everything", positive="1") #validation
+
+# testing sets
+pred_test <- predict (model_lr, X_test, type = "response")
+pred_class <- pred_test
+pred_class[pred_class >=0.23] <- 1;  pred_class[pred_class <0.23] <- 0
+# Performance
+confusionMatrix(factor(pred_class), factor(y_test), mode = "everything", positive="1")
+auc(y_test, pred_test) # AUC
+plot(roc(y_test, pred_test), main="ROC curve -- Logistic Regression")
+#############################################################
+
+# used with threshold 0.5
+#############################################################
+pred_train <- predict (model_lr, X_train, type = "response")
+pred_val <- predict (model_lr, X_val, type = "response")
+pred_tclass <- pred_train
+pred_vclass <- pred_val
+
+pred_tclass[pred_tclass >=0.5] <- 1; pred_tclass[pred_tclass <0.5] <- 0
+pred_vclass[pred_vclass >=0.5] <- 1; pred_vclass[pred_vclass <0.5] <- 0
+
+# Performance
+confusionMatrix(factor(pred_tclass), factor(y_train), mode = "everything", positive="1") #train
+confusionMatrix(factor(pred_vclass), factor(y_val), mode = "everything", positive="1") #validation
+
+#############################################################
+#                                                           #
+#            Performance Report - Logistic Regression       #
+#                                                           #
+#############################################################
+
+# testing sets
+pred_test <- predict (model_lr, X_test, type = "response")
+pred_class <- pred_test
+pred_class[pred_class >=0.5] <- 1;  pred_class[pred_class <0.5] <- 0
+# Performance
+confusionMatrix(factor(pred_class), factor(y_test), mode = "everything", positive="1")
+auc(y_test, pred_test) # AUC
+plot(roc(y_test, pred_test), main="ROC curve -- Logistic Regression")
+
+# Histogram of predictions
+data.frame(preds = pred_test) %>%
+  ggplot(aes(x = pred_test)) + 
+  geom_histogram(bins = 50, fill = 'grey40') +
+  labs(title = 'Histogram of Predictions') +
+  theme( axis.text=element_text(size=12),
+         axis.title=element_text(size=16,face="bold")) 
+
+# Range of predictions
+round(range(pred_test),2)
+# Median of predictions
+median(pred_test)
+
+#######################################################################
+#                                                                     #
+#                    (2) Fit Random Forest Model                      #
+#                                                                     #
+#######################################################################
+
+#Sys.setenv(JAVA_HOME="C:\\Program Files\\Java\\jdk1.8.0_25\\jre")
+#Sys.getenv("JAVA_HOME")
+
+# Fit all features
+predictor <- train3[,-21]
+y_train <- factor(y_train)
+model_rf <- randomForest(predictor, y_train, mtry=5, ntree=101, importance=TRUE) 
+model_rf
+plot(model_rf)
+
+#############################################################
+#                                                           #
+#            Select Features Based on Importance            #
+#                                                           #
+#############################################################
+
+# Importance of features
+imp <- importance(model_rf) %>% data.frame() %>% mutate(feature = row.names(.)) 
+imp_dsc <- imp[order(imp$MeanDecreaseAccuracy, decreasing = TRUE),]
+imp_dsc
+
+importance <- importance(model_rf) 
+# Create data frame using importance. 
+varImportance <- data.frame(Variables = row.names(importance), 
+                            Importance = round(importance[,'MeanDecreaseAccuracy'], 0))
+varImportance <- varImportance[order(varImportance$Importance, decreasing = TRUE),]
+varImportance
+# Create interactive plot.  
+ggplot(varImportance, aes(x = reorder(Variables, Importance), 
+                          y = Importance, fill = Importance)) +
+  geom_bar(stat='identity') + 
+  labs(title = 'Importance of predictors', x = 'Predictors', y = 'rmsle') +
+  coord_flip() + 
+  theme_light()
+
+# Features selection
+features <- varImportance$Variables[varImportance$Importance > 10]
+length(features)
+features
+
+# For comparison with logistic regression-9 features
+# features <- varImportance$Variables[varImportance$Importance > 15]
+# length(features)
+#features
+
+predictor_train <- train3[,which(names(train3) %in% features)]
+predictor_val <- val3[,which(names(val3) %in% features)]
+predictor_test <- test3[,which(names(test3) %in% features)]
+
+# Fit model 
+model_rf2 <- randomForest(predictor_train, y_train,sampsize =0.01*length(y_train), 
+                          mtry=8, ntree=1501, importance=TRUE) 
+model_rf2 
+getTree(model_rf2, 1, labelVar=TRUE)
+plot(model_rf2,log="x",main="black default, red samplesize, green tree depth")
+
+#############################################################
+#                                                           #
+#            Prediction on data - Random Forest             #
+#                                                           #
+#############################################################
+
+# Model Prediction
+pred_train <- predict(model_rf2, predictor_train, type = "prob")
+pred_val <- predict(model_rf2, predictor_val, type = "prob")
+
+# Validate - performance
+pred_tclass <- pred_train[,2]
+pred_vclass <- pred_val[,2]
+pred_tclass[pred_tclass >=0.5] <- 1;  pred_tclass[pred_tclass <0.5] <- 0
+pred_vclass[pred_vclass >=0.5] <- 1;  pred_vclass[pred_vclass <0.5] <- 0
+
+confusionMatrix(factor(pred_tclass), factor(y_train), mode = "everything", positive="1")
+confusionMatrix(factor(pred_vclass), factor(y_val), mode = "everything", positive="1")
+auc(y_train, pred_train[,2]) # AUC
+auc(y_val, pred_val[,2]) # AUC
+
+#library(pROC)
+plot(roc(y_train, pred_train[,2]), main="ROC curve -- Random Forest ")
+plot(roc(y_val, pred_val[,2]), main="ROC curve -- Random Forest")
+
+#############################################################
+#                                                           #
+#              Model Performance - Random Forest            #
+#                                                           #
+#############################################################
+
+pred_test <- predict(model_rf2, predictor_test, type = "prob")
+pred_class <- pred_test[,2]
+pred_class[pred_class >=0.5] <- 1;  pred_class[pred_class <0.5] <- 0
+
+# Report Performance
+confusionMatrix(factor(pred_class), factor(y_test), mode = "everything", positive="1")
+auc(y_test, pred_test[,2]) # AUC
+plot(roc(y_test, pred_test[,2]), main="ROC curve -- Random Forest")
+
+# Histogram of predictions
+data.frame(preds = pred_test[,2]) %>%
+  ggplot(aes(x = pred_test[,2])) + 
+  geom_histogram(bins = 50, fill = 'grey40') +
+  labs(title = 'Histogram of Predictions') +
+  theme_bw()
+
+# Range of predictions
+round(range(pred_test[,2]),2)
+# Median of predictions
+median(pred_test[,2])
+
+#######################################################################
+#                                                                     #
+#                             (3) XGBoost                             #
+#                                                                     #
+#######################################################################
+
+# One-hot emcoding
+dummy <- dummyVars(" ~ .", data=X_train)
+X_trainc <- data.frame(predict(dummy, newdata = X_train))
+dummy <- dummyVars(" ~ .", data=X_val)
+X_valc <- data.frame(predict(dummy, newdata = X_val))
+dummy <- dummyVars(" ~ .", data=X_test)
+X_testc <- data.frame(predict(dummy, newdata = X_test))
+
+#############################################################
+#                                                           #
+#                        PCA (Optional)                     #
+#                                                           #
+#############################################################
+train3$rep_education <- factor(train3$rep_education)
+sparse_matrix <- sparse.model.matrix(Def_ind~.-1, data = train3)
+output_vector = train3$Def_ind
+sparse_matrixt <- sparse.model.matrix(Def_ind~.-1, data = val3)
+output_vectort = val3$Def_ind
+
+# PCA scaling the x variables
+pca <- prcomp (X_trainc, center = TRUE, scale = TRUE)
+plot((pca$sdev)^2, type ="b")
+pca$rotation
+barplot((pca$sdev)^2/(sum((pca$sdev)^2))*100) # variance
+X_trainc <- pca$x[,1:12]
+
+# plot(X_trainc$x[,1],X_trainc$x[,2])
+# X_trainc$x
+X_valc <- predict(pca, newdata = X_valc)
+X_valc <- X_valc[, 1:12]
+
+X_testc <- predict(pca, newdata = X_testc)
+X_testc <- X_testc [, 1:12]
+
+#############################################################
+#                                                           #
+#                     Fit XGBoost Model                     #
+#                                                           #
+#############################################################
+
+# Define train, validation, test data
+y_train <- train3$Def_ind
+y_val <- as.numeric(y_val)
+y_test <- as.numeric(y_test)
+
+dtrain = xgb.DMatrix(data = as.matrix(X_trainc), label = y_train)
+dval = xgb.DMatrix(data = as.matrix(X_valc), label = y_val)
+dtest = xgb.DMatrix(data = as.matrix(X_testc), label = y_test)
+
+# define watchlist
+watchlist = list(train = dtrain, validation = dval)
+
+# Tuning the model
+
+# negative & positive cases in the data
+negative_cases <- sum(y_train == 0)
+postive_cases <- sum(y_train == 1)
+
+# set XGB parameters 
+param <- list(  objective           = "binary:logistic", 
+                booster             = "gbtree",
+                eval_metric         = "auc",
+                eta                 = 0.02,     
+                max_depth           = 2,       
+                subsample           = 0.95,     
+                colsample_bytree    = 0.3,       
+                min_child_weight    = 2,    
+                num_parallel_tree   = 1        
+)
+
+nrounds <- 1500
+early.stop.round <- 50
+
+# Fit and tune XGB model
+model <- xgb.train( params              = param, 
+                    data                = dtrain, 
+                    nrounds             = nrounds, 
+                    verbose             = 1,
+                    print_every_n       = 100,
+                    early_stopping_rounds = early.stop.round,
+                    #scale_pos_weight = 0.35*(negative_cases/postive_cases),or
+                    #scale_pos_weight = sqrt(negative_cases/postive_cases)
+                    # VIP: use grid search, google article
+                    #or alter threshold
+                    watchlist           = watchlist,
+                    maximize            = TRUE)
+
+#############################################################
+#                                                           #
+#               Study Individual Variable Effect            #
+#                                                           #
+############################################################# 
+# method 1: PDP plots for effects of individual variable/partial dependence plot
+# pd2 <- partial(model, pred.var = c("uti_open_card", "num_card_inq_24_month"), plot =FALSE, prob= TRUE, train = X_trainc)
+partial(model, pred.var = c("ind_XYZ.1"), plot =T, prob= T, train = X_trainc)
+
+pd <- partial(model, pred.var = "ind_XYZ.1", plot = FALSE,prob= T, train = X_trainc)
+head(pd)
+plot(pd)
+
+library(ggplot2)
+p2 <- autoplot(pd, contour = TRUE, main = "ggplot2 version", 
+               legend.title = "Partial\ndependence")
+p2
+
+# method 2 to show single effect: SHAP plots for effects of individual variable
+# Step 1: Select some observations
+X <- data.matrix(X_trainc[sample(nrow(X_trainc), 1000), ]) ###
+X
+# Step 2: Crunch SHAP values
+shap <- shap.prep(model, X_train = X)
+
+# Step 3: SHAP importance
+shap.plot.summary(shap)
+
+# Step 4: Loop over dependence plots in decreasing importance
+for (v in shap.importance(shap, names_only = TRUE)) {
+  p <- shap.plot.dependence(shap, v, color_feature = "auto", 
+                            alpha = 0.5, jitter_width = 0.1) +
+    ggtitle(v)
+  print(p)
+}
+
+# hyperparameters
+inputs <- c("nrounds"=model$bestInd,
+            "eta"=param$eta,
+            "max_depth"=param$max_depth,
+            "subsample"=param$subsample,
+            "colsample_bytree"=param$colsample_bytree,
+            "min_child_weight"=param$min_child_weight,
+            "num_parallel_tree"=param$num_parallel_tree)
+inputs
+
+# Prediction on training set
+pred_train <- predict(model,dtrain)
+pred_tclass <- pred_train
+
+pred_tclass[pred_tclass >=0.5] <- 1;  pred_tclass[pred_tclass <0.5] <- 0
+confusionMatrix(factor(pred_tclass), factor(y_train), mode = "everything", positive="1")
+auc(y_train, pred_train)
+
+# Prediction on validation set
+pred_val <- predict(model,dval)
+pred_vclass <- pred_val
+pred_vclass[pred_vclass >=0.5] <- 1;  pred_vclass[pred_vclass <0.5] <- 0
+confusionMatrix(factor(pred_vclass), factor(y_val), mode = "everything", positive="1")
+auc(y_val, pred_val)
+
+# prediction on test set - performance report 
+pred_test <- predict(model,dtest)
+pred_tclass <- pred_test
+pred_tclass[pred_tclass >=0.5] <- 1;  pred_tclass[pred_tclass <0.5] <- 0
+confusionMatrix(factor(pred_tclass), factor(y_test), mode = "everything", positive="1")
+auc(y_test, pred_test)
+plot(roc(y_test, pred_test), main="ROC curve -- Xgboost")
+
+# Show one of the trees
+xgb.plot.multi.trees(feature_names = names(data.matrix(X_trainc)),
+                     model = model)
+
+
+# convert log odds to probability
+odds_to_probs <- function(odds){
+  return(exp(odds)/ (1 + exp(odds)))
+}
+
+# e.g. prob of being in class 1 if directed to the top leaf
+odds_to_probs(0.18222)  # = 0.545
+
+# Importance of features
+imp <- xgb.importance(model = model)
+imp
+ggplot(imp, aes(x = reorder(Feature, Gain), 
+                y = Gain, fill = Gain)) +
+  geom_bar(stat='identity') + 
+  labs(title = 'Importance of features', x = 'Features', y = 'Gain') +
+  coord_flip() + 
+  theme_light()
+
+
+# Histogram of predictions
+data.frame(preds = pred_test) %>%
+  ggplot(aes(x = pred_test)) + 
+  geom_histogram(bins = 50, fill = 'grey40') +
+  labs(title = 'Histogram of Predictions') +
+  theme_bw()
+
+# Range of predictions
+round(range(pred_test),2)
+# Median of predictions
+median(pred_test)
+
